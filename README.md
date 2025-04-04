@@ -107,6 +107,11 @@ FastAPI	uvicorn main:app --reload	8000
 Next.js	npm run dev	3000
 ```
 
+```bash
+poetry run uvicorn app.main:app --reload
+npm run dev
+```
+
 
 CORS: Cross-Origin resource Sharing
 It is crucial when your frontend (Next.js) and backend (FastAPI) are running on different domains/ports.
