@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     # create a subclass called Settings that inherits from BaseSettings
     SUPABASE_URL: str
     SUPABASE_KEY: str
+    OPENAI_API_KEY: str
     EMBEDDING_MODEL_NAME: str = "all-MiniLM-L6-v2" # optional
     APP_ENV: str = "development" # optional, tracks environment (dev/staging/prod)
     DEBUG: bool = False # optional, tracks if the app is in debug mode

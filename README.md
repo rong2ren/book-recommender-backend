@@ -112,6 +112,10 @@ poetry run uvicorn app.main:app --reload
 npm run dev
 ```
 
+```bash
+poetry run python -m app.load_books_from_csv
+```
+
 
 CORS: Cross-Origin resource Sharing
 It is crucial when your frontend (Next.js) and backend (FastAPI) are running on different domains/ports.
@@ -142,3 +146,18 @@ The system uses Supabase as its database
 Embeddings are generated using sentence-transformers
 CORS is configured to allow frontend-backend communication
 Environment variables are managed with pydantic-settings
+
+
+# AI options
+## description
+Hugging Face has several text generation models. Models like BART or T5 might be suitable. I should check if there are any pre-trained models specifically for book summaries. Oh, there's 'pszemraj/led-base-book-summary' which is designed for book summaries. Problem with pszemraj/led-base-book-summary:
+Designed for full-text summarization, not metadata-to-description. Struggles with limited input (just title/author/publisher)
+
+## genre classification
+The 'jjzha/book_genre_classification' model on Hugging Face is tailored for this. It can predict multiple genres, which is better than single-label classification.
+## wikidata
+Wikidata is another avenue. By querying ISBNs, they can fetch existing descriptions. But not all books might have entries, so it's a supplementary source. They'll need to handle missing data gracefully.
+
+## Groq + Mixtral
+Wikidata → Local LLM → DeepSeek Fallback
+

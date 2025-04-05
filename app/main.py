@@ -57,16 +57,19 @@ app.add_middleware(
 
 # Pydantic models
 class Book(BaseModel):
-    id: int
-    isbn: str
+    id: str  # Changed from int to str for UUID
     title: str
-    author: str
-    publish_year: int
+    authors: str  # Changed from author to authors
+    average_rating: Optional[float] = None  # Changed from rating
+    isbn: Optional[str] = None
+    isbn13: Optional[str] = None  # Added
+    language_code: Optional[str] = None  # Added
+    num_pages: Optional[int] = None  # Changed from page_count
+    publisher: Optional[str] = None  # Added
+    publish_year: Optional[int] = None
     description: Optional[str] = None
-    cover_url: Optional[str] = None
     genre: Optional[str] = None
-    rating: Optional[float] = None
-    page_count: Optional[int] = None
+    cover_url: Optional[str] = None
     tags: Optional[List[str]] = None
 
 class RecommendationRequest(BaseModel):
@@ -80,20 +83,30 @@ class RecommendationResponse(BaseModel):
 def generate_fake_books(count: int = 10) -> List[dict]:
     genres = ["Fantasy", "Sci-Fi", "Mystery", "Romance", "Thriller", "Non-Fiction"]
     authors = ["J.K. Rowling", "George R.R. Martin", "Stephen King", "Agatha Christie", "Isaac Asimov"]
+    languages = ["eng", "spa", "fre", "ger", "jpn"]
+    publishers = ["Penguin Books", "HarperCollins", "Random House", "Simon & Schuster", "Scholastic"]
+    
+    import uuid
     
     books = []
     for i in range(1, count + 1):
+        book_id = str(uuid.uuid4())
+        genre = random.choice(genres)
+        
         books.append({
-            "id": i,
-            "isbn": f"978-{random.randint(100, 999)}-{random.randint(10000, 99999)}-{random.randint(0, 9)}",
+            "id": book_id,
             "title": f"Book {i} - The {random.choice(['Lost', 'Final', 'Secret'])} {random.choice(['Kingdom', 'Experiment', 'Code'])}",
-            "author": random.choice(authors),
+            "authors": random.choice(authors),
+            "average_rating": round(random.uniform(3.5, 5.0), 1),
+            "isbn": f"978{random.randint(1000000000, 9999999999)}",
+            "isbn13": f"978{random.randint(1000000000, 9999999999)}",
+            "language_code": random.choice(languages),
+            "num_pages": random.randint(150, 600),
+            "publisher": random.choice(publishers),
             "publish_year": random.randint(1990, 2023),
             "description": f"A {random.choice(['captivating', 'thrilling', 'heartwarming'])} story about {random.choice(['a hero journey', 'scientific discovery', 'historical event'])}.",
+            "genre": genre,
             "cover_url": f"https://picsum.photos/200/300?random={i}",
-            "genre": random.choice(genres),
-            "rating": round(random.uniform(3.5, 5.0), 1),
-            "page_count": random.randint(150, 600),
             "tags": random.sample(["bestseller", "award-winning", "series", "adapted", "classic"], k=2)
         })
     return books
