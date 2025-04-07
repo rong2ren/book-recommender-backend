@@ -2,7 +2,7 @@
 Script to clean and upload Goodreads books data to Supabase.
 This script will:
 1. Clean and preprocess the CSV data
-2. Create the necessary table in Supabase if it doesn't exist
+2. Generate descriptions and genres using AI
 3. Upload the cleaned data to Supabase
 """
 import os
@@ -17,7 +17,7 @@ from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Optional
 import openai
 from tenacity import retry, wait_exponential, stop_after_attempt
-
+import requests
 from .config import settings
 
 # Initialize clients
@@ -28,8 +28,7 @@ embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL_NAME)
 # Constants
 CHUNK_SIZE = 1000  # For pandas chunking
 BATCH_SIZE = 50    # For Supabase uploads
-RETRY_ATTEMPTS = 3
-EMBEDDING_BATCH_SIZE = 32
+RETRY_ATTEMPTS = 1
 
 # Genre taxonomy for AI classification
 GENRE_TAXONOMY = [
@@ -63,22 +62,6 @@ def clean_language_code(code: str) -> str:
     }
     return lang_map.get(code, code[:2] if len(code) >= 2 else 'en')
 
-def get_wikidata_description(isbn: str) -> Optional[str]:
-    """Fetch description from Wikidata"""
-    try:
-        query = f"""SELECT ?desc WHERE {{
-            ?book wdt:P212 "{isbn}".
-            ?book schema:description ?desc.
-            FILTER(LANG(?desc) = "en")
-        }} LIMIT 1"""
-        
-        response = requests.get(
-            "https://query.wikidata.org/sparql",
-            params={"query": query, "format": "json"}
-        )
-        return response.json()['results']['bindings'][0]['desc']['value']
-    except:
-        return None
 
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
 def ai_generate_field(prompt: str, system_message: str, max_tokens=200) -> Optional[str]:
@@ -132,14 +115,193 @@ def enhance_book_with_ai(row: pd.Series) -> pd.Series:
         'created_at': pd.Timestamp.now().isoformat()
     })
 
-def format_supabase_genres(books):
-    for book in books:
-        # Ensure genres array is properly formatted
-        if isinstance(book['genres'], list):
-            book['genres'] = [str(g)[:50] for g in book['genres']]
-        else:
-            book['genres'] = []
-    return books
+def get_open_library_data(isbn: str, isbn13: str) -> dict:
+    """
+    Query Open Library API for book information using the direct ISBN API approach.
+    
+    Args:
+        isbn: ISBN-10
+        isbn13: ISBN-13
+        
+    Returns:
+        Dictionary with description and genres
+    """
+    if isbn or isbn13:
+        try:
+            isbn_key = isbn13 or isbn
+            logger.debug(f"Querying Open Library ISBN API with: {isbn_key}")
+            
+            # Direct ISBN API approach
+            url = f"https://openlibrary.org/isbn/{isbn_key}.json"
+            
+            try:
+                response = requests.get(
+                    url,
+                    headers={"User-Agent": "BookRecommender/1.0 (research project)"},
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    edition_data = response.json()
+                    
+                    # Get the work ID to fetch additional details
+                    if "works" in edition_data and len(edition_data["works"]) > 0:
+                        work_key = edition_data["works"][0]["key"]
+                        logger.info(f"[OpenLibrary] Found work key: {work_key}")
+            
+                        # Fetch work data to get subjects/genres
+                        work_url = f"https://openlibrary.org{work_key}.json"
+                        
+                        try:
+                            work_response = requests.get(
+                                work_url,
+                                headers={"User-Agent": "BookRecommender/1.0 (research project)"},
+                                timeout=10
+                            )
+                            
+                            if work_response.status_code == 200:
+                                work_data = work_response.json()
+                                
+                                # Get description
+                                description = None
+                                if "description" in work_data:
+                                    if isinstance(work_data["description"], dict):
+                                        description = work_data["description"].get("value")
+                                    else:
+                                        description = work_data["description"]
+                                # Get subjects/genres
+                                subjects = work_data.get("subjects", [])
+                                    
+                                return {
+                                    'description': description,
+                                    'genres': subjects
+                                }
+                        except Exception as e:
+                            logger.warning(f"[OpenLibrary] Error fetching work data: {str(e)}")
+            except Exception as e:
+                logger.warning(f"[OpenLibrary] Error querying Open Library ISBN API: {str(e)}")
+        except Exception as e:
+            logger.warning(f"[OpenLibrary] Error in Open Library data retrieval: {str(e)}")
+    
+    # If we get here, no data was found with ISBN or there was an error
+    logger.debug(f"[OpenLibrary] No Open Library data found for {isbn}")
+    return {'description': None, 'genres': []}
+
+def get_google_books_data(title: str, author: str, isbn: str = None, isbn13: str = None) -> dict:
+    """
+    Query Google Books API for book information including description and genre categories.
+    
+    Args:
+        title: Book title
+        author: Book author
+        isbn: ISBN-10 (optional)
+        isbn13: ISBN-13 (optional)
+        
+    Returns:
+        Tuple of (description, genres list)
+    """
+    base_url = "https://www.googleapis.com/books/v1/volumes"
+    
+    # Try different query strategies in order of specificity
+    query_strategies = []
+    
+    # Strategy 1: ISBN search (most specific)
+    if isbn13:
+        query_strategies.append(f"isbn:{isbn13}")
+    if isbn:
+        query_strategies.append(f"isbn:{isbn}")
+    
+    # Strategy 2: Title + Author search
+    if title and author:
+        # Clean up the title and author for better search results
+        clean_title = title.strip().replace('"', '').split('(')[0].strip()
+        clean_author = author.strip().split(',')[0].strip()
+        query_strategies.append(f'intitle:"{clean_title}" inauthor:"{clean_author}"')
+    
+    for query in query_strategies:
+        try:
+            logger.debug(f"[GoogleBooks] Querying Google Books API with: {query}")
+            params = {
+                "q": query,
+                "maxResults": 3,  # Limit to avoid excessive data
+            }
+            
+            response = requests.get(
+                base_url, 
+                params=params,
+                headers={"User-Agent": "BookRecommender/1.0 (research project)"},
+                timeout=5
+            )
+            
+            if response.status_code != 200:
+                logger.warning(f"[GoogleBooks] Google Books API returned status code {response.status_code}")
+                continue
+                
+            data = response.json()
+            
+            if data.get('totalItems', 0) == 0:
+                logger.debug(f"[GoogleBooks] No Google Books results for: {query}")
+                continue
+                
+            # Process the first (most relevant) result
+            for item in data.get('items', []):
+                volume_info = item.get('volumeInfo', {})
+                
+                # Check if this is likely the right book (title similarity)
+                if title and volume_info.get('title'):
+                    title_match = title.lower() in volume_info.get('title', '').lower() or \
+                                 volume_info.get('title', '').lower() in title.lower()
+                    
+                    if not title_match:
+                        continue
+                
+                logger.info(f"[GoogleBooks] Found Google Books result.")
+
+                return {
+                    'description': volume_info.get('description'),
+                    'genres': volume_info.get('categories', [])
+                }
+                
+            
+        except Exception as e:
+            logger.warning(f"[GoogleBooks] Error querying Google Books API: {str(e)}")
+    
+    # If we got here, no data was found with any strategy
+    logger.debug(f"[GoogleBooks] No Google Books data found for: {title}")
+    return {'description': None, 'genres': []}
+
+def generate_genres(row: pd.Series) -> List[str]:
+    """
+    Generate a list of genres for a book:
+    1. Use genres from Google Books API if available (without taxonomy mapping)
+    2. Fall back to a default genre
+    
+    Args:
+        row: A pandas Series containing book data
+        
+    Returns:
+        A list of genre strings
+    """
+    return ["General Fiction"]
+
+def generate_description(row: pd.Series) -> str:
+    """
+    Generate a description for a book by trying multiple sources:
+    1. Use existing description if available
+    2. Try to fetch from Google Books API using ISBN or title/author
+    3. Fall back to a simple generated description
+    
+    Args:
+        row: A pandas Series containing book data
+        
+    Returns:
+        A string containing the book description
+    """
+    # First check if description already exists in the source data
+    if pd.notna(row.get('description')):
+        return str(row['description'])
+    
+    return f"A book titled '{row['title']}' by {row['authors']}."
 
 def basic_clean(df: pd.DataFrame) -> pd.DataFrame:
     """Essential cleaning operations"""
@@ -154,33 +316,155 @@ def basic_clean(df: pd.DataFrame) -> pd.DataFrame:
     df['language_code'] = df['language_code'].apply(clean_language_code)
     df['num_pages'] = pd.to_numeric(df['num_pages'], errors='coerce').fillna(0).astype(int)
     df['average_rating'] = pd.to_numeric(df['average_rating'], errors='coerce').clip(0, 5)
-    df['publication_date'] = pd.to_datetime(df['publication_date'], errors='coerce', format='%m/%d/%Y')
-    df['publish_year'] = df['publication_date'].dt.year.fillna(-1).astype(int)
+    df['ratings_count'] = pd.to_numeric(df['ratings_count'], errors='coerce').fillna(0).astype(int)
+    df['publication_date'] = pd.to_datetime(df['publication_date'], errors='coerce', format='%m/%d/%Y').apply(
+        lambda x: x.strftime('%Y-%m-%d') if pd.notna(x) else None
+    )
 
-    # AI Processing
-    df['description'] = df.apply(generate_description, axis=1)
-    df['genres'] = df.apply(generate_genres, axis=1)
+    # Get Google data and AI fallbacks in single apply
+    df[['description', 'genres']] = df.apply(
+        enhance_row_with_apis,
+        axis=1,
+        result_type='expand'
+    )
+    # Extract primary genre from genres list
+    df['primary_genre'] = df['genres'].apply(lambda x: x[0] if x and len(x) > 0 else "General Fiction")
+    
+    # Generate cover URL
     df['cover_url'] = df.apply(
         lambda x: f"https://covers.openlibrary.org/b/isbn/{x['isbn13'] or x['isbn']}-L.jpg" 
                     if x['isbn13'] or x['isbn'] else "",
         axis=1
     )
-    
-    # Add UUIDs
-    # if 'id' not in df.columns:
-    #     df['id'] = [str(uuid.uuid4()) for _ in range(len(df))]
+
+    # Generate a unique ID for each book
+    df['id'] = df.apply(
+        lambda x: str(uuid.uuid5(
+            uuid.NAMESPACE_DNS,
+            f"{x['title']}|{x['authors']}|{x['isbn13'] or x['isbn'] or ''}"
+        )),
+        axis=1
+    )
     
     return df
 
-def load_books_from_csv(csv_path: str, limit: int = None) -> List[Dict]:
-    """Load and process books with optional limit"""
-    logger.info(f"Loading books from {csv_path} ({limit or 'all'} records)")
+def enhance_row_with_apis(row: pd.Series) -> pd.Series:
+    title = row.get('title', '')
+    author = row.get('authors', '')
+    logger.debug(f"Enhancing book data for: {title} by {author}")
     
-    processed_books = []
+    description_ol, description_gb = None, None
+    genres_ol, genres_gb = [], []
+
+    # === Try Open Library API ===
+    try:
+        ol_result = get_open_library_data(
+            row.get('isbn') if pd.notna(row.get('isbn')) else None,
+            row.get('isbn13') if pd.notna(row.get('isbn13')) else None
+        )
+        description_ol = ol_result.get('description')
+        genres_ol = ol_result.get('genres', [])
+    except Exception as e:
+        logger.warning(f"Open Library error for {title}: {e}")
+    
+    # === Try Google Books API ===
+    try:
+        gb_result = get_google_books_data(
+            title,
+            author,
+            row.get('isbn') if pd.notna(row.get('isbn')) else None,
+            row.get('isbn13') if pd.notna(row.get('isbn13')) else None
+        )
+        description_gb = gb_result.get('description')
+        genres_gb = gb_result.get('genres', [])
+    except Exception as e:
+        logger.warning(f"Google Books API error for {title}: {e}")
+    
+    # === Pick best description ===
+    description = description_gb or description_ol or f"A book titled '{title}' by {author}."
+
+    # # Prefer longer if both exist
+    # if description_ol and description_gb:
+    #     if len(description_gb) > len(description_ol):
+    #         logger.debug(f"Using longer Google Books description")
+    #         description = description_gb
+    #     else:
+    #         logger.debug(f"Using longer Open Library description")
+    #         description = description_ol
+
+    # === Merge + deduplicate genres ===
+    merged_genres = list({g.strip() for g in (genres_ol + genres_gb) if g.strip()})
+    if not merged_genres:
+        merged_genres = ["Unknown"]
+    
+    return pd.Series({
+        'description': description,
+        'genres': merged_genres
+    })
+
+def build_embedding_text(row: pd.Series) -> str:
+    """
+    Build a rich text representation of a book for embedding generation.
+    Combines relevant fields to create a comprehensive semantic representation.
+    
+    Args:
+        row: A pandas Series containing book data
+        
+    Returns:
+        A string containing the text to be embedded
+    """
+    embedding_text = f"{row['title']} {row['authors']} {row['description']} {' '.join(row['genres'])}"
+    return embedding_text
+
+def load_books_from_csv(csv_path: str, limit: int = None, start_line: int = 0):
+    """Load and process books with optional limit and start line
+    
+    Args:
+        csv_path: Path to the CSV file
+        limit: Optional limit on number of books to process
+        start_line: Line number to start reading from (0-indexed, header is line 0)
+    """
+    # check if the table exists in supabase
+    if not check_supabase_table():
+        logger.error("Books table does not exist in Supabase. Please create the table first.")
+        return
+    # check if the file exists
+    if not os.path.exists(csv_path):
+        logger.error(f"File {csv_path} does not exist. Please check the path.")
+        return
+    
+    # check if the file is empty
+    if os.path.getsize(csv_path) == 0:
+        logger.error(f"File {csv_path} is empty. Please check the file.")
+        return
+    
+    logger.info(f"Loading books from {csv_path} (starting at line {start_line+1}, processing {limit or 'all'} records)")
     total_processed = 0
-    
-    for i, chunk in enumerate(pd.read_csv(csv_path, chunksize=CHUNK_SIZE, on_bad_lines='warn')):
-        logger.info(f"Processing chunk {i+1}")
+    # Choose appropriate chunk size
+    effective_chunk_size = min(CHUNK_SIZE, limit) if limit else CHUNK_SIZE
+    # Define columns to keep - exclude 'bookid' and other unwanted columns
+    usecols = [
+        'title', 'authors', 'average_rating', 'isbn', 'isbn13',
+        'language_code', '  num_pages', 'ratings_count', 'publication_date',
+        'publisher'  # Include any other columns you need
+    ]
+    dtypes = {
+        'isbn': str, 
+        'isbn13': str
+    }
+
+    csv_reader = pd.read_csv(
+        csv_path, 
+        chunksize=effective_chunk_size, 
+        on_bad_lines='warn',
+        nrows=limit,
+        usecols=usecols,
+        dtype=dtypes,
+        skiprows=range(1, start_line+1) if start_line > 0 else None  # Skip rows but keep header
+    )
+
+    for i, chunk in enumerate(csv_reader):
+        logger.info(f"Processing chunk {i+1} (starting from line {start_line+1})")
         # Apply limit
         if limit and total_processed >= limit:
             logger.info("Limit reached. Exiting.")
@@ -196,100 +480,14 @@ def load_books_from_csv(csv_path: str, limit: int = None) -> List[Dict]:
 
         # 2. Generate embeddings for that chunk.
         texts = chunk.apply(build_embedding_text, axis=1)
-        chunk['embedding'] = embedding_model.encode(texts.tolist()).tolist()
+        chunk['embedding'] = embedding_model.encode(texts.tolist(), show_progress_bar=True).tolist()
 
         # 3. Upload the processed chunk to Supabase immediately.
-        processed_books.extend(chunk.to_dict(orient='records'))
-        total_processed += len(chunk)
+        uploaded_count = upload_chunk(chunk.to_dict(orient='records'))
+        total_processed += uploaded_count
     
-    logger.success(f"Successfully processed {len(processed_books)}/{limit or 'all'} books")
-    return processed_books
+    logger.success(f"Successfully processed {total_processed}/{limit or 'all'} books (starting from line {start_line+1})")
 
-# def clean_csv_data(csv_path: str, limit: int = None) -> List[Dict]:
-#     logger.info(f"Loading books from {csv_path} ({limit or 'all'} records)")
-    
-#     # Process in chunks for memory efficiency
-#     chunks = []
-#     for i, chunk in enumerate(pd.read_csv(csv_path, chunksize=CHUNK_SIZE, on_bad_lines='warn')):
-#         logger.info(f"Processing chunk {i+1}")
-        
-#         # Basic cleaning
-#         chunk = chunk.drop_duplicates(subset=['title', 'authors'])
-#         chunk.columns = [col.strip().lower() for col in chunk.columns]
-        
-#         # Type conversion
-#         chunk['num_pages'] = pd.to_numeric(chunk['num_pages'], errors='coerce').fillna(0).astype(int)
-#         chunk['average_rating'] = pd.to_numeric(chunk['average_rating'], errors='coerce').clip(0, 5)
-        
-#         # Date handling
-#         chunk['publication_date'] = pd.to_datetime(
-#             chunk['publication_date'], errors='coerce', format='%m/%d/%Y')
-#         chunk['publish_year'] = chunk['publication_date'].dt.year.fillna(-1).astype(int)
-        
-#         # Clean identifiers
-#         chunk['isbn'] = chunk['isbn'].apply(validate_isbn)
-#         chunk['isbn13'] = chunk['isbn13'].apply(validate_isbn)
-        
-#         # Language normalization
-#         chunk['language_code'] = chunk['language_code'].apply(clean_language_code)
-        
-#         # AI Enhancement
-#         logger.info("Enhancing data with AI...")
-#         ai_fields = chunk.apply(enhance_book_with_ai, axis=1)
-#         chunk = pd.concat([chunk, ai_fields], axis=1)
-        
-#         # Generate cover URL
-#         chunk['cover_url'] = chunk.apply(
-#             lambda x: f"https://covers.openlibrary.org/b/isbn/{x['isbn13'] or x['isbn']}-L.jpg" 
-#                       if x['isbn13'] or x['isbn'] else "",
-#             axis=1
-#         )
-        
-#         chunks.append(chunk)
-    
-#     df = pd.concat(chunks, ignore_index=True)
-    
-#     # Generate embeddings in bulk
-#     logger.info("Generating embeddings...")
-#     texts = (
-#         df['title'] + " " + 
-#         df['authors'] + " " + 
-#         df['ai_description'] + " " + 
-#         df['genres'].apply(lambda x: ' '.join(x))  # Convert list to string
-#     ).tolist()
-    
-#     embeddings = embedding_model.encode(
-#         texts,
-#         batch_size=EMBEDDING_BATCH_SIZE,
-#         show_progress_bar=True,
-#         convert_to_numpy=True
-#     )
-#     df['embedding'] = embeddings.tolist()
-    
-#     # Final schema validation
-#     required_columns = {
-#         'id': str,
-#         'title': str,
-#         'authors': str,
-#         'ai_description': str,
-#         'genres': object,
-#         'primary_genre': str,
-#         'embedding': object,
-#         'isbn': str,
-#         'language_code': str,
-#         'publish_year': int
-#     }
-    
-#     for col, dtype in required_columns.items():
-#         if col not in df.columns:
-#             if col == 'id':
-#                 df['id'] = [str(uuid.uuid4()) for _ in range(len(df))]
-#             else:
-#                 raise ValueError(f"Missing required column: {col}")
-#         df[col] = df[col].astype(dtype)
-    
-#     logger.info(f"Cleaning complete. Final records: {len(df)}")
-#     return df.to_dict(orient='records')
 
 def check_supabase_table():
     """
@@ -307,43 +505,42 @@ def check_supabase_table():
         logger.warning(f"Books table does not exist or is not accessible: {str(e)}")
         return False
 
-def create_supabase_table():
-    """Create optimized books table if not exists"""
-    table_definition = {
-        "id": "uuid primary key",
-        "title": "text",
-        "authors": "text",
-        "ai_description": "text",
-        "genres": "text[]",
-        "primary_genre": "text",
-        "isbn": "text",
-        "isbn13": "text",
-        "language_code": "text",
-        "publish_year": "integer",
-        "num_pages": "integer",
-        "average_rating": "float",
-        "cover_url": "text",
-        "embedding": "vector(384)",  # Match model dimension
-        "created_at": "timestamptz"
-    }
+
+def upload_chunk(chunk: List[Dict]) -> int:
+    """Upload processed chunk to Supabase in batches with per-batch retries"""
+    if not chunk:
+        logger.warning("No chunk to upload")
+        return 0
     
-    try:
-        supabase.rpc('create_table_if_not_exists', {
-            'table_name': 'books',
-            'columns': table_definition
-        }).execute()
-        logger.info("Table created/verified")
-    except Exception as e:
-        logger.error(f"Table creation failed: {str(e)}")
-        raise
+    logger.info(f"Uploading chunk of {len(chunk)} books in batches of {BATCH_SIZE}")
+    total_uploaded = 0
+    
+    # Process in batches
+    for i in range(0, len(chunk), BATCH_SIZE):
+        batch = chunk[i:i+BATCH_SIZE]
+        try:
+            uploaded = upload_batch(batch, batch_num=i//BATCH_SIZE + 1, 
+                                  total_batches=(len(chunk)-1)//BATCH_SIZE + 1)
+            total_uploaded += uploaded
+        except Exception as e:
+            logger.error(f"Batch {i//BATCH_SIZE + 1} failed after all retry attempts: {str(e)}")
+
+    logger.info(f"Chunk upload complete: {total_uploaded}/{len(chunk)} books")
+    return total_uploaded
 
 @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(RETRY_ATTEMPTS))
-def upload_chunk(chunk: List[Dict]):
-    """Upload processed chunk to Supabase"""
+def upload_batch(batch: List[Dict], batch_num: int, total_batches: int) -> int:
+    """Upload a single batch to Supabase with retries"""
     try:
-        return supabase.table('books').upsert(chunk).execute()
+        # update or insert base on id (primary key)
+        response = supabase.table('books').upsert(batch).execute()
+        batch_count = len(response.data)
+        logger.info(f"Uploaded batch {batch_num}/{total_batches}: {batch_count} books")
+        return batch_count
     except Exception as e:
-        logger.error(f"Failed to upload chunk: {str(e)}")
+        logger.error(f"Failed to upload batch {batch_num}: {str(e)}")
+        # This will be retried by the decorator if attempts remain
+        raise  # Re-raise to trigger retry
 
 def validate_book(book: Dict) -> bool:
     """Validate book structure"""
@@ -357,61 +554,17 @@ def main():
     """Main pipeline execution"""
     try:
         # Clean and enhance data
-        books = clean_csv_data('dataset/books.csv')
-        books = format_supabase_genres(books)
-        # Validate before upload
-        if not validate_data(books):
-            logger.error("Data validation failed. Aborting upload.")
-            return
+        csv_path = 'dataset/books.csv'
+        start_line = 0  # Start from the beginning by default
+        limit = 10      # Process 10 books by default
         
-        # Upload to Supabase
-        upload_to_supabase(books)
-        logger.success("Pipeline completed successfully")
-        
+        # You can change these values as needed or read them from command line arguments
+        load_books_from_csv(csv_path, limit=limit, start_line=start_line)
     except Exception as e:
         logger.critical(f"Pipeline failed: {str(e)}")
         # Implement your alerting logic here
 
-def build_embedding_text(row: pd.Series) -> str:
-    """
-    Build a rich text representation of a book for embedding generation.
-    Combines relevant fields to create a comprehensive semantic representation.
-    
-    Args:
-        row: A pandas Series containing book data
-        
-    Returns:
-        A string containing the text to be embedded
-    """
-    # Collect available text fields with fallbacks for missing data
-    fields = []
-    
-    # Primary identifiers
-    if row.get('title'):
-        fields.append(f"Title: {row['title']}")
-    
-    if row.get('authors'):
-        fields.append(f"Author: {row['authors']}")
-    
-    # Content description
-    if row.get('description'):
-        fields.append(f"Description: {row['description']}")
-    
-    # Genre information
-    if isinstance(row.get('genres'), list) and row['genres']:
-        fields.append(f"Genres: {', '.join(row['genres'])}")
-    elif isinstance(row.get('genres'), str):
-        fields.append(f"Genres: {row['genres']}")
-    
-    # Additional context
-    if row.get('publisher'):
-        fields.append(f"Publisher: {row['publisher']}")
-    
-    if row.get('publish_year') and row['publish_year'] > 0:
-        fields.append(f"Year: {row['publish_year']}")
-    
-    # Combine fields with spaces for better embedding
-    return " ".join(fields)
+
 
 if __name__ == "__main__":
     main()

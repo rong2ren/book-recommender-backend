@@ -3,22 +3,21 @@ create extension if not exists vector;
 
 -- Create books table
 create table if not exists public.books (
-  id uuid primary key,
+  id uuid primary key default uuid_generate_v4(),
   title text not null,
   authors text not null,
-  average_rating float,
+  average_rating float4,
   isbn text,
   isbn13 text,
   language_code text,
-  num_pages integer,
-  ratings_count integer,
-  text_reviews_count integer,
+  num_pages int4,
+  ratings_count int4,
   publication_date date,
-  publisher text,
-  publish_year integer,
   description text,
-  genre text,
+  genres text[],
+  primary_genre text,
   cover_url text,
+  publisher text,
   embedding vector(384), -- Dimension for all-MiniLM-L6-v2 model
   created_at timestamp with time zone default now()
 );
