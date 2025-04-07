@@ -18,6 +18,7 @@ from typing import List, Dict, Optional
 import openai
 from tenacity import retry, wait_exponential, stop_after_attempt
 import requests
+from difflib import get_close_matches
 from .config import settings
 
 # Initialize clients
@@ -32,10 +33,87 @@ RETRY_ATTEMPTS = 1
 
 # Genre taxonomy for AI classification
 GENRE_TAXONOMY = [
-    "Fantasy", "Mystery", "Romance", "Science Fiction", 
-    "Non-Fiction", "Historical Fiction", "Thriller", "Biography",
-    "Young Adult", "Children's", "Literary Fiction"
+    # Fiction genres
+    "Fantasy",
+    "Science Fiction",
+    "Mystery",
+    "Thriller",
+    "Horror",
+    "Romance",
+    "Historical Fiction",
+    "Literary Fiction",
+    "Adventure",
+    "Coming of Age",
+    "Dystopian",
+    "Contemporary Fiction",
+    "Young Adult",
+    "Children's",
+    "Graphic Novel",
+    "Short Stories",
+
+    # Non-fiction genres
+    "Biography",
+    "Memoir",
+    "Self-Help",
+    "Psychology",
+    "Health & Wellness",
+    "True Crime",
+    "Science",
+    "History",
+    "Philosophy",
+    "Religion",
+    "Politics",
+    "Economics",
+    "Education",
+    "Business",
+    "Technology",
+    "Travel",
+    "Cookbook",
+    "Art & Photography",
+    "Parenting",
+    "Spirituality",
+
+    # Hybrid or cross-genre
+    "Humor",
+    "Essays",
+    "Poetry",
+    "Journalism",
+    "Anthology"
 ]
+
+
+def normalize_genre_name(raw: str) -> str:
+    """
+    Normalize a raw genre string to title-case and remove special characters.
+    Uses only regex and built-in string methods without additional libraries.
+    """
+    if not raw:
+        return raw
+    # Lowercase and strip whitespace
+    clean = raw.lower().strip()
+    
+    # Remove punctuation, digits, and special characters 
+    clean = re.sub(r"[^a-z\s]", "", clean)
+    
+    # Replace multiple spaces with a single space
+    clean = re.sub(r"\s+", " ", clean)
+    
+    # Title-case for consistency
+    return clean.title()
+
+def map_to_taxonomy(genres: List[str], taxonomy: List[str], threshold=0.6) -> List[str]:
+    """
+    Try to match incoming genre strings to your predefined taxonomy using fuzzy matching.
+    """
+    normalized = []
+    for g in genres:
+        cleaned = normalize_genre_name(g)
+        
+        # Fuzzy match to closest taxonomy entry
+        match = get_close_matches(cleaned, taxonomy, n=1, cutoff=threshold)
+        if match:
+            normalized.append(match[0])
+    return list(set(normalized))  # Remove duplicates
 
 def validate_isbn(isbn: str) -> str:
     """Validate and clean ISBN numbers"""
@@ -270,39 +348,6 @@ def get_google_books_data(title: str, author: str, isbn: str = None, isbn13: str
     logger.debug(f"[GoogleBooks] No Google Books data found for: {title}")
     return {'description': None, 'genres': []}
 
-def generate_genres(row: pd.Series) -> List[str]:
-    """
-    Generate a list of genres for a book:
-    1. Use genres from Google Books API if available (without taxonomy mapping)
-    2. Fall back to a default genre
-    
-    Args:
-        row: A pandas Series containing book data
-        
-    Returns:
-        A list of genre strings
-    """
-    return ["General Fiction"]
-
-def generate_description(row: pd.Series) -> str:
-    """
-    Generate a description for a book by trying multiple sources:
-    1. Use existing description if available
-    2. Try to fetch from Google Books API using ISBN or title/author
-    3. Fall back to a simple generated description
-    
-    Args:
-        row: A pandas Series containing book data
-        
-    Returns:
-        A string containing the book description
-    """
-    # First check if description already exists in the source data
-    if pd.notna(row.get('description')):
-        return str(row['description'])
-    
-    return f"A book titled '{row['title']}' by {row['authors']}."
-
 def basic_clean(df: pd.DataFrame) -> pd.DataFrame:
     """Essential cleaning operations"""
     # Deduplicate
@@ -393,13 +438,14 @@ def enhance_row_with_apis(row: pd.Series) -> pd.Series:
     #         description = description_ol
 
     # === Merge + deduplicate genres ===
-    merged_genres = list({g.strip() for g in (genres_ol + genres_gb) if g.strip()})
+    merged_genres = list({(g.strip()) for g in (genres_ol + genres_gb) if g.strip()})
     if not merged_genres:
         merged_genres = ["Unknown"]
+    mapped_genres = map_to_taxonomy(merged_genres, GENRE_TAXONOMY)
     
     return pd.Series({
         'description': description,
-        'genres': merged_genres
+        'genres': mapped_genres
     })
 
 def build_embedding_text(row: pd.Series) -> str:
@@ -416,13 +462,13 @@ def build_embedding_text(row: pd.Series) -> str:
     embedding_text = f"{row['title']} {row['authors']} {row['description']} {' '.join(row['genres'])}"
     return embedding_text
 
-def load_books_from_csv(csv_path: str, limit: int = None, start_line: int = 0):
+def load_books_from_csv(csv_path: str, limit: int = None, start_line: int = 1):
     """Load and process books with optional limit and start line
     
     Args:
         csv_path: Path to the CSV file
         limit: Optional limit on number of books to process
-        start_line: Line number to start reading from (0-indexed, header is line 0)
+        start_line: Line number to start reading from (1-indexed where 1 is the first data row after header)
     """
     # check if the table exists in supabase
     if not check_supabase_table():
@@ -438,7 +484,7 @@ def load_books_from_csv(csv_path: str, limit: int = None, start_line: int = 0):
         logger.error(f"File {csv_path} is empty. Please check the file.")
         return
     
-    logger.info(f"Loading books from {csv_path} (starting at line {start_line+1}, processing {limit or 'all'} records)")
+    logger.info(f"Loading books from {csv_path} (starting at line {start_line}, processing {limit or 'all'} records)")
     total_processed = 0
     # Choose appropriate chunk size
     effective_chunk_size = min(CHUNK_SIZE, limit) if limit else CHUNK_SIZE
@@ -453,6 +499,9 @@ def load_books_from_csv(csv_path: str, limit: int = None, start_line: int = 0):
         'isbn13': str
     }
 
+    # Convert to 0-indexed for skiprows parameter (skiprows=0 means skip first row)
+    skip_rows = start_line - 1 if start_line > 1 else None
+    
     csv_reader = pd.read_csv(
         csv_path, 
         chunksize=effective_chunk_size, 
@@ -460,11 +509,11 @@ def load_books_from_csv(csv_path: str, limit: int = None, start_line: int = 0):
         nrows=limit,
         usecols=usecols,
         dtype=dtypes,
-        skiprows=range(1, start_line+1) if start_line > 0 else None  # Skip rows but keep header
+        skiprows=range(1, skip_rows+1) if skip_rows else None  # Skip rows but keep header
     )
 
     for i, chunk in enumerate(csv_reader):
-        logger.info(f"Processing chunk {i+1} (starting from line {start_line+1})")
+        logger.info(f"Processing chunk {i+1} (starting from line {start_line})")
         # Apply limit
         if limit and total_processed >= limit:
             logger.info("Limit reached. Exiting.")
@@ -486,7 +535,7 @@ def load_books_from_csv(csv_path: str, limit: int = None, start_line: int = 0):
         uploaded_count = upload_chunk(chunk.to_dict(orient='records'))
         total_processed += uploaded_count
     
-    logger.success(f"Successfully processed {total_processed}/{limit or 'all'} books (starting from line {start_line+1})")
+    logger.success(f"Successfully processed {total_processed}/{limit or 'all'} books (starting from line {start_line})")
 
 
 def check_supabase_table():
@@ -555,7 +604,7 @@ def main():
     try:
         # Clean and enhance data
         csv_path = 'dataset/books.csv'
-        start_line = 0  # Start from the beginning by default
+        start_line = 1  # Start from the first data row after header
         limit = 10      # Process 10 books by default
         
         # You can change these values as needed or read them from command line arguments
