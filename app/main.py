@@ -9,7 +9,8 @@ from .config import settings
 from supabase import create_client
 from sentence_transformers import SentenceTransformer
 import random
-from datetime import datetime
+from datetime import date, datetime
+import time
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -57,20 +58,28 @@ app.add_middleware(
 
 # Pydantic models
 class Book(BaseModel):
-    id: str  # Changed from int to str for UUID
+    id: str
     title: str
-    authors: str  # Changed from author to authors
-    average_rating: Optional[float] = None  # Changed from rating
+    authors: str
+    average_rating: Optional[float] = None
     isbn: Optional[str] = None
-    isbn13: Optional[str] = None  # Added
-    language_code: Optional[str] = None  # Added
-    num_pages: Optional[int] = None  # Changed from page_count
-    publisher: Optional[str] = None  # Added
-    publish_year: Optional[int] = None
+    isbn13: Optional[str] = None
+    language_code: Optional[str] = None
+    num_pages: Optional[int] = None
+    publisher: Optional[str] = None
+    publication_date: Optional[date] = None
+    ratings_count: Optional[int] = None
     description: Optional[str] = None
-    genre: Optional[str] = None
+    primary_genre: Optional[str] = None
+    genres: Optional[List[str]] = None
     cover_url: Optional[str] = None
-    tags: Optional[List[str]] = None
+    similarity: Optional[float] = None
+
+    class Config:
+        from_attributes = True  # Keep this as it's needed for Supabase
+        json_encoders = {
+            date: lambda v: v.isoformat() if v else None
+        }
 
 class RecommendationRequest(BaseModel):
     query: str
@@ -128,28 +137,55 @@ async def search_books(request: RecommendationRequest):
 @app.post("/recommend", response_model=RecommendationResponse)
 async def recommend_books(request: RecommendationRequest):
     """Get book recommendations based on natural language query"""
+
     try:
         # Get services from app state
         model = app.state.model
         supabase = app.state.supabase
+
+        session = supabase.auth.get_session()
+        if session:
+            user = session.user
+            logger.debug(f"authenticated userId: {user.id}")
+        else:
+            logger.debug("No authenticated user.")
         
-        # Validate query
-        if not request.query.strip():
-            raise ValueError("Query cannot be empty")
+        # Validate and clean query
+        query = request.query.strip()
+        if not query:
+            raise HTTPException(status_code=400, detail="Query cannot be empty")
             
-        logger.info(f"Processing query: '{request.query}'")
-        
+        logger.info(f"Processing query: '{query}'")
+        start_time = time.time()
         # Generate embedding
-        embedding = model.encode(request.query).tolist()
-        
+        embedding = model.encode(query).tolist()
+        logger.debug(f"Generated embedding dimension: {len(embedding)}")
+        # Format as [x,y,z] string - this matches the vector syntax requirement
+            
+        # Debug logging
+        logger.debug(f"Embedding type: {type(embedding)}")
+        logger.debug(f"Embedding length: {len(embedding)}")
+        # logger.debug(f"Embedding: {embedding}")
+
+
         # Get recommendations
+        # If the embedding is a list in Python, it's sent as a JSON array. So the function expects a vector, but gets a float array. Hence, a type mismatch.
         response = supabase.rpc(
             'similar_books',
             {
                 'query_embedding': embedding,
+                'match_threshold': 0.001,
                 'match_count': request.max_results
             }
         ).execute()
+        logger.debug(f"Response: {response}")
+
+        # print(response.data)
+
+        query_time_ms = int((time.time() - start_time) * 1000)
+        logger.info(f"Vector search time: {query_time_ms}ms")
+
+       
 
         if not response.data:
             logger.info("No results found for query")

@@ -27,7 +27,7 @@ openai.api_key = settings.OPENAI_API_KEY
 embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL_NAME)
 
 # Constants
-CHUNK_SIZE = 1000  # For pandas chunking
+CHUNK_SIZE = 500  # For pandas chunking
 BATCH_SIZE = 50    # For Supabase uploads
 RETRY_ATTEMPTS = 1
 
@@ -502,6 +502,8 @@ def load_books_from_csv(csv_path: str, limit: int = None, start_line: int = 1):
     # Convert to 0-indexed for skiprows parameter (skiprows=0 means skip first row)
     skip_rows = start_line - 1 if start_line > 1 else None
     
+    start_time = time.time()
+    
     csv_reader = pd.read_csv(
         csv_path, 
         chunksize=effective_chunk_size, 
@@ -513,7 +515,15 @@ def load_books_from_csv(csv_path: str, limit: int = None, start_line: int = 1):
     )
 
     for i, chunk in enumerate(csv_reader):
+        current_time = time.time()
+        elapsed = current_time - start_time
+        
+        # Calculate percentage of total if limit is set
+        percentage = f"{(total_processed / limit * 100):.1f}%" if limit else "unknown"
+        
         logger.info(f"Processing chunk {i+1} (starting from line {start_line})")
+        logger.info(f"Progress: {total_processed}/{limit or 'unknown'} ({percentage}) - Elapsed time: {int(elapsed//60)}m {int(elapsed%60)}s")
+        
         # Apply limit
         if limit and total_processed >= limit:
             logger.info("Limit reached. Exiting.")
@@ -535,7 +545,9 @@ def load_books_from_csv(csv_path: str, limit: int = None, start_line: int = 1):
         uploaded_count = upload_chunk(chunk.to_dict(orient='records'))
         total_processed += uploaded_count
     
-    logger.success(f"Successfully processed {total_processed}/{limit or 'all'} books (starting from line {start_line})")
+    total_time = time.time() - start_time
+    minutes, seconds = divmod(total_time, 60)
+    logger.success(f"Successfully processed {total_processed}/{limit or 'all'} books in {int(minutes)}m {int(seconds)}s (starting from line {start_line})")
 
 
 def check_supabase_table():
@@ -605,7 +617,7 @@ def main():
         # Clean and enhance data
         csv_path = 'dataset/books.csv'
         start_line = 1  # Start from the first data row after header
-        limit = 10      # Process 10 books by default
+        limit = 1000
         
         # You can change these values as needed or read them from command line arguments
         load_books_from_csv(csv_path, limit=limit, start_line=start_line)
